@@ -4,7 +4,7 @@ import aiosqlite
 import sys
 from pathlib import Path
 from datetime import datetime
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 import numpy as np
@@ -31,6 +31,7 @@ class EpisodicRAG:
         self.path = Path(db_path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._model = None
+        self._reranker_model = None
 
     PREFIX_PATTERN = re.compile(
         r"^(TALK TO USER:|FINAL ANSWER:|CLARIFICATION NEEDED:)\s*", re.IGNORECASE
@@ -194,6 +195,18 @@ class EpisodicRAG:
                 raise e
         return self._model
 
+    @property
+    def reranker_model(self):
+        if self._reranker_model is None:
+            try:
+                model_name = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+                self._reranker_model = CrossEncoder(model_name)
+                logger.info(f"Cross-encoder reranker model loaded successfully: {model_name}")
+            except Exception as e:
+                logger.error(f"Error loading cross-encoder model: {e}")
+                raise e
+        return self._reranker_model
+
     def _embedding_chunk(self, chunk):
         try:
             content = chunk["content"] if isinstance(chunk, dict) else chunk
@@ -202,6 +215,42 @@ class EpisodicRAG:
         except Exception as e:
             logger.error(f"Error generating embedding: {e}")
             return None
+
+    def rerank_results(self, query, results):
+        """
+        Rerank search results using cross-encoder model for better relevance.
+
+        Args:
+            query: The search query string
+            results: List of result dictionaries with 'context' and 'score' keys
+
+        Returns:
+            Reranked list of results sorted by cross-encoder scores
+        """
+        try:
+            if not results:
+                return results
+
+            # Prepare query-context pairs for cross-encoder
+            pairs = [[query, result["context"]] for result in results]
+
+            # Get cross-encoder scores
+            ce_scores = self.reranker_model.predict(pairs)
+
+            # Add reranker scores to results
+            for i, result in enumerate(results):
+                result["rerank_score"] = float(ce_scores[i])
+                result["original_score"] = result["score"]
+
+            # Sort by reranker scores (descending)
+            reranked = sorted(results, key=lambda x: x["rerank_score"], reverse=True)
+
+            logger.info(f"Reranked {len(results)} results using cross-encoder")
+            return reranked
+
+        except Exception as e:
+            logger.error(f"Error during reranking: {e}")
+            return results
 
     async def custom_text_splitters(self, past_summary_date=None):
         try:
@@ -473,7 +522,7 @@ class EpisodicRAG:
         except Exception as e:
             logger.error(f"Error during index creation: {e}")
 
-    def retrieve_chunks(self, query, conditions=None, top_k=5):
+    def retrieve_chunks(self, query, conditions=None, top_k=5, use_reranker=True, initial_k=20):
         try:
             if conditions is None:
                 conditions = {}
@@ -505,10 +554,13 @@ class EpisodicRAG:
 
             query_filter = models.Filter(must=must) if must else None
 
+            # Retrieve more candidates for reranking
+            retrieval_limit = initial_k if use_reranker else top_k
+
             search_result = client.query_points(
                 collection_name="episodic_chunks",
                 query=query_vector.tolist(),
-                limit=top_k,
+                limit=retrieval_limit,
                 query_filter=query_filter,
                 with_payload=True,
                 with_vectors=False,
@@ -593,6 +645,14 @@ class EpisodicRAG:
                         }
                     )
                     seen_ids.add(hit.id)
+
+            # Apply reranking if enabled
+            if use_reranker and expanded_results:
+                logger.info(f"Reranking {len(expanded_results)} initial results...")
+                expanded_results = self.rerank_results(query, expanded_results)
+                # Return only top_k after reranking
+                expanded_results = expanded_results[:top_k]
+                logger.info(f"Returning top {len(expanded_results)} results after reranking")
 
             return expanded_results
 
